@@ -13,7 +13,8 @@ import yaml
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
 LLM_API_KEY = os.environ["LLM_API_KEY"]
-LLM_MODEL = os.getenv("LLM_MODEL") or "llama-3.3-70b-versatile"
+# llama-3.3-70b-versatile у Groq отключена, поэтому по умолчанию gpt-oss-120b
+LLM_MODEL = os.getenv("LLM_MODEL") or "openai/gpt-oss-120b"
 
 WEEKDAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -35,9 +36,25 @@ PROMPT = """Ты редактор новостной подборки для Tel
 Новости:
 {items}"""
 
+TAG_RE = re.compile(r'<(?:/?b|a href="[^"<>]+"|/a)>')
+
 
 def clean(text):
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", text or ""))).strip()
+
+
+def sanitize(text):
+    """Оставляем только <b> и <a href>, остальное экранируем, чтобы Telegram не ругался."""
+    out, pos = [], 0
+    for m in TAG_RE.finditer(text):
+        out.append(html.escape(html.unescape(text[pos:m.start()]), quote=False))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(html.escape(html.unescape(text[pos:]), quote=False))
+    res = "".join(out)
+    if res.count("<b>") != res.count("</b>") or res.count("<a ") != res.count("</a>"):
+        res = re.sub(r"<[^>]+>", "", res)  # теги не сошлись: убираем их все
+    return res
 
 
 def fetch_topic(topic, d):
@@ -62,9 +79,35 @@ def fetch_topic(topic, d):
                 continue
             seen.add(key)
             source = (e.get("source") or {}).get("title") or feed.feed.get("title", "источник")
-            items.append((ts, title, source, e.get("link", ""), clean(e.get("summary"))[:300]))
+            items.append((ts, title, source, e.get("link", ""), clean(e.get("summary"))[:200]))
     items.sort(reverse=True)
     return items[: d["max_items_per_topic"]]
+
+
+def llm_call(prompt):
+    """Запрос к модели; при лимите (429) ждём и повторяем."""
+    for attempt in range(6):
+        r = requests.post(
+            f"{LLM_BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            json={"model": LLM_MODEL, "temperature": 0.4,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=120,
+        )
+        if r.status_code == 429:
+            try:
+                wait = float(r.headers.get("retry-after", ""))
+            except ValueError:
+                wait = 20 * (attempt + 1)
+            wait = min(max(wait, 5), 90)
+            print(f"Лимит модели (429), жду {wait:.0f} с и повторяю")
+            time.sleep(wait)
+            continue
+        if r.status_code >= 400:
+            print("LLM ответ:", r.text[:300])
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    raise RuntimeError("модель не ответила из-за лимитов")
 
 
 def summarize(topic, items, d):
@@ -77,15 +120,7 @@ def summarize(topic, items, d):
         style=d["style"] + (". " + topic["hint"] if topic.get("hint") else ""),
         emoji_part="<эмодзи по смыслу> " if d["emoji_per_news"] else "",
         items="\n".join(lines))
-    r = requests.post(
-        f"{LLM_BASE_URL}/chat/completions",
-        headers={"Authorization": f"Bearer {LLM_API_KEY}"},
-        json={"model": LLM_MODEL, "temperature": 0.4,
-              "messages": [{"role": "user", "content": prompt}]},
-        timeout=120,
-    )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    return sanitize(llm_call(prompt))
 
 
 def build_blocks(d, now):
@@ -100,12 +135,29 @@ def build_blocks(d, now):
             print("LLM error", topic["name"], e)
             continue
         blocks.append(f"{topic.get('emoji', '📌')} <b>{html.escape(topic['name'])}</b>\n\n{body}")
+        time.sleep(d.get("pause_seconds", 8))  # пауза, чтобы не упереться в лимиты
     if blocks:
         head = f"📰 <b>{html.escape(d['title'])}</b>"
         if d["show_date"]:
             head += f" — {WEEKDAYS[now.weekday()]}, {now.day} {MONTHS[now.month - 1]} {now.year}"
         blocks[0] = head + "\n\n" + blocks[0]
     return blocks
+
+
+def tg_send(token, chat, text):
+    """Отправка в Telegram; если HTML не принят, шлём простым текстом."""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    r = requests.post(url, json={"chat_id": chat, "text": text, "parse_mode": "HTML",
+                                 "disable_web_page_preview": True}, timeout=30)
+    if r.status_code == 200:
+        return
+    print("Telegram ответил:", r.status_code, r.text[:300])
+    plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+    r2 = requests.post(url, json={"chat_id": chat, "text": plain,
+                                  "disable_web_page_preview": True}, timeout=30)
+    if r2.status_code != 200:
+        print("Telegram (простой текст) ответил:", r2.status_code, r2.text[:300])
+        r2.raise_for_status()
 
 
 def send_telegram(blocks, d):
@@ -122,12 +174,7 @@ def send_telegram(blocks, d):
     if cur.strip():
         messages.append(cur.strip())
     for m in messages:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat, "text": m, "parse_mode": "HTML",
-                  "disable_web_page_preview": True},
-            timeout=30)
-        r.raise_for_status()
+        tg_send(token, chat, m)
         time.sleep(1)
 
 
@@ -151,11 +198,18 @@ def run_digest(name, d, now):
     print(f"== {name}")
     blocks = build_blocks(d, now)
     if not blocks:
-        return print("Нет новостей за период")
-    if "telegram" in d["channels"]:
-        send_telegram(blocks, d)
-    if "email" in d["channels"]:
-        send_email(blocks, d, now)
+        print("Нет новостей за период")
+        return False
+    ok = True
+    for channel, fn in (("telegram", lambda: send_telegram(blocks, d)),
+                        ("email", lambda: send_email(blocks, d, now))):
+        if channel in d["channels"]:
+            try:
+                fn()
+            except Exception as e:
+                print(f"Ошибка отправки ({channel}):", e)
+                ok = False
+    return ok
 
 
 if __name__ == "__main__":
@@ -163,6 +217,7 @@ if __name__ == "__main__":
     defaults = cfg.get("defaults", {})
     only = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     now = datetime.now(ZoneInfo(defaults.get("timezone", "Asia/Yekaterinburg")))
+    failed = False
     for name, raw in cfg["digests"].items():
         d = {**defaults, **raw}
         if only:
@@ -170,4 +225,7 @@ if __name__ == "__main__":
                 continue
         elif d.get("days") and DAY_KEYS[now.weekday()] not in d["days"]:
             continue  # сегодня не его день
-        run_digest(name, d, now)
+        if not run_digest(name, d, now):
+            failed = True
+    if failed:
+        sys.exit(1)
