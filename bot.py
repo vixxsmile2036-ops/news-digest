@@ -1,21 +1,18 @@
-"""Бот с выбором региона.
+"""Бот подписки на личную рассылку по региону.
   python bot.py --post-menu   # запостить в паблик сообщение с кнопками регионов
   python bot.py               # слушать бота постоянно (на сервере/ПК)
-  python bot.py --once        # обработать накопившиеся нажатия и выйти (для GitHub Actions)"""
-import os, sys, time, html, yaml, requests
+  python bot.py --once        # обработать накопившиеся нажатия и выйти (для GitHub Actions)
+Сами новости рассылает digest.py по расписанию, бот только оформляет и отменяет подписки."""
+import os, sys, time, yaml, requests
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
-import digest
+import storage
 
 TOKEN = os.environ["TG_TOKEN"]
 API = f"https://api.telegram.org/bot{TOKEN}"
-CFG = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "config.yaml"), encoding="utf-8"))
-DEFAULTS, BOT = CFG.get("defaults", {}), CFG["bot"]
+CFG = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"), encoding="utf-8"))
+BOT = CFG["bot"]
 REGIONS = BOT["regions"]
-CACHE_TTL = 3 * 3600   # одну и ту же подборку не пересобираем 3 часа
-COOLDOWN = 20          # секунд между запросами одного человека
-_cache, _last = {}, {}
 
 
 def tg(method, **params):
@@ -23,57 +20,6 @@ def tg(method, **params):
     r = requests.post(f"{API}/{method}", json=params, timeout=70)
     r.raise_for_status()
     return r.json()["result"]
-
-
-def region_blocks(slug):
-    reg = REGIONS[slug]
-    d = {**DEFAULTS, "title": f"Новости: {reg['name']}", "show_date": True}
-    for k in ("period_days", "news_per_topic", "style", "language", "max_items_per_topic"):
-        if k in BOT:
-            d[k] = BOT[k]
-    topics = []
-    for t in BOT["topics"]:
-        feeds = list(t.get("feeds", [])) + (reg.get("feeds", []) if t.get("region_feeds") else [])
-        topics.append({**t, "feeds": feeds,
-                       "queries": [q.format(region=reg["name"], city=reg["city"]) for q in t["queries"]]})
-    d["topics"] = topics
-    now = datetime.now(ZoneInfo(DEFAULTS.get("timezone", "Asia/Yekaterinburg")))
-    return digest.build_blocks(d, now)
-
-
-def send_blocks(chat, blocks):
-    messages, cur = [], ""
-    for b in blocks:
-        if len(cur) + len(b) + 2 > 3900 and cur:
-            messages.append(cur.strip())
-            cur = ""
-        cur += b + "\n\n"
-    if cur.strip():
-        messages.append(cur.strip())
-    for m in messages:
-        tg("sendMessage", chat_id=chat, text=m, parse_mode="HTML", disable_web_page_preview=True)
-        time.sleep(0.5)
-
-
-def send_region(chat, slug):
-    if time.time() - _last.get(chat, 0) < COOLDOWN:
-        return tg("sendMessage", chat_id=chat, text="⏳ Подборка уже собирается, подождите минуту.")
-    _last[chat] = time.time()
-    tg("sendMessage", chat_id=chat, text=f"⏳ Собираю подборку: {REGIONS[slug]['name']}…")
-    hit = _cache.get(slug)
-    if hit and time.time() - hit[0] < CACHE_TTL:
-        blocks = hit[1]
-    else:
-        try:
-            blocks = region_blocks(slug)
-        except Exception as e:
-            print("region error", slug, e)
-            blocks = []
-        if blocks:
-            _cache[slug] = (time.time(), blocks)
-    if not blocks:
-        return tg("sendMessage", chat_id=chat, text="Не получилось собрать подборку, попробуйте позже.")
-    send_blocks(chat, blocks)
 
 
 def menu_keyboard(url_buttons=False, username=None):
@@ -87,47 +33,70 @@ def menu_keyboard(url_buttons=False, username=None):
     return {"inline_keyboard": rows}
 
 
-def handle(u):
+def subscribe(state, chat, slug):
+    old = state["users"].get(str(chat), {})
+    state["users"][str(chat)] = {"region": slug, "since": old.get("since") or datetime.now().strftime("%Y-%m-%d")}
+    tg("sendMessage", chat_id=chat, text=BOT["welcome_text"].format(region=REGIONS[slug]["name"]))
+    return True
+
+
+def handle(u, state):
+    """Обрабатывает одно обновление. True, если список подписчиков изменился."""
     cq = u.get("callback_query")
     if cq:
         tg("answerCallbackQuery", callback_query_id=cq["id"])
-        data = cq.get("data", "")
+        data, chat = cq.get("data", ""), cq["message"]["chat"]["id"]
         if data.startswith("r:") and data[2:] in REGIONS:
-            send_region(cq["message"]["chat"]["id"], data[2:])
-        return
+            return subscribe(state, chat, data[2:])
+        return False
     msg = u.get("message") or {}
-    text, chat = msg.get("text", ""), (msg.get("chat") or {}).get("id")
-    if not chat or not text.startswith("/"):
-        return
+    if (msg.get("chat") or {}).get("type") != "private":
+        return False
+    text, chat = msg.get("text", ""), msg["chat"]["id"]
+    if not text.startswith("/"):
+        return False
     parts = text.split(maxsplit=1)
     cmd, arg = parts[0].split("@")[0], (parts[1].strip() if len(parts) > 1 else "")
     if cmd == "/start" and arg in REGIONS:
-        send_region(chat, arg)
-    elif cmd in ("/start", "/regions"):
-        tg("sendMessage", chat_id=chat, text=BOT["menu_text"], reply_markup=menu_keyboard())
+        return subscribe(state, chat, arg)
+    if cmd in ("/start", "/regions"):
+        cur = state["users"].get(str(chat))
+        note = f"\nСейчас выбран: {REGIONS[cur['region']]['name']}" if cur and cur.get("region") in REGIONS else ""
+        tg("sendMessage", chat_id=chat, text=BOT["choose_text"] + note, reply_markup=menu_keyboard())
+        return False
+    if cmd == "/stop":
+        if state["users"].pop(str(chat), None) is not None:
+            tg("sendMessage", chat_id=chat, text="Вы отписались от рассылки. Чтобы подписаться снова, нажмите /start")
+            return True
+        tg("sendMessage", chat_id=chat, text="Вы и не были подписаны. Выбрать регион: /start")
+    return False
 
 
 def poll(once=False):
     offset = None
     while True:
         try:
+            state = storage.load()  # подписчиков мог изменить digest.py, поэтому читаем заново
             updates = tg("getUpdates", offset=offset, timeout=0 if once else 50,
                          allowed_updates=["message", "callback_query"])
         except Exception as e:
-            print("getUpdates error", e)
+            print("getUpdates/load error", e)
             if once:
-                return
+                raise
             time.sleep(5)
             continue
+        changed = False
         for u in updates:
             offset = u["update_id"] + 1
             try:
-                handle(u)
+                changed = handle(u, state) or changed
             except Exception as e:
                 print("handle error", e)
+        if changed:
+            storage.save(state)  # сначала сохраняем, потом подтверждаем обновления
         if once:
             if updates:
-                tg("getUpdates", offset=offset, timeout=0)  # подтвердить, что обработали
+                tg("getUpdates", offset=offset, timeout=0)
             return
 
 
@@ -143,4 +112,6 @@ if __name__ == "__main__":
     if "--post-menu" in sys.argv:
         post_menu()
     else:
+        if os.getenv("GITHUB_ACTIONS") and not storage.configured():
+            sys.exit("Не заданы секреты GIST_ID и GIST_TOKEN: без них подписки не сохранятся")
         poll(once="--once" in sys.argv)
