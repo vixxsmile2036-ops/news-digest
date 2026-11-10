@@ -212,9 +212,13 @@ def deliver_to_subscribers(d, channel_blocks, now, cfg):
         print("Подписчиков пока нет")
         return True
     regions = cfg.get("bot", {}).get("regions", {})
+    active_regions = set(storage.load_settings().get("active_regions", regions.keys()))
     groups = {}
     for uid, u in users.items():
-        groups.setdefault(u.get("region") if mode == "regional" else "*", []).append(uid)
+        region = u.get("region")
+        if mode == "regional" and (region not in regions or region not in active_regions):
+            continue
+        groups.setdefault(region if mode == "regional" else "*", []).append(uid)
     blocked, ok = [], True
     for key, uids in groups.items():
         if mode == "regional":
