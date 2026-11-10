@@ -28,3 +28,5 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
