@@ -1,0 +1,33 @@
+name: News digest
+on:
+  schedule:
+    - cron: "0 3 * * *"   # каждый день 03:00 UTC = 08:00 по Екатеринбургу
+                          # (в какие дни какой выпуск уходит, задаётся в config.yaml)
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "Имя выпуска из config.yaml: monday, wednesday или friday (пусто = по расписанию)"
+        required: false
+        default: ""
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -r requirements.txt
+      - run: python digest.py "${{ github.event.inputs.digest }}"
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
