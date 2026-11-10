@@ -11,6 +11,8 @@ import feedparser
 import requests
 import yaml
 
+import storage
+
 LLM_BASE_URL = os.getenv("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
 LLM_API_KEY = os.environ["LLM_API_KEY"]
 # llama-3.3-70b-versatile у Groq отключена, поэтому по умолчанию gpt-oss-120b
@@ -136,6 +138,8 @@ def build_blocks(d, now):
             continue
         blocks.append(f"{topic.get('emoji', '📌')} <b>{html.escape(topic['name'])}</b>\n\n{body}")
         time.sleep(d.get("pause_seconds", 8))  # пауза, чтобы не упереться в лимиты
+    if blocks and d.get("footer"):
+        blocks.append(html.escape(d["footer"]))
     if blocks:
         head = f"📰 <b>{html.escape(d['title'])}</b>"
         if d["show_date"]:
@@ -160,22 +164,94 @@ def tg_send(token, chat, text):
         r2.raise_for_status()
 
 
-def send_telegram(blocks, d):
-    token = os.getenv("TG_TOKEN")
-    chat = d.get("telegram_chat") or os.getenv("TG_CHAT_ID")
-    if not (token and chat):
-        return print("Telegram не настроен, пропускаю")
+def chunk(blocks):
+    """Режем подборку на сообщения до ~4000 символов (лимит Telegram 4096), по разделам."""
     messages, cur = [], ""
-    for b in blocks:  # лимит Telegram 4096 символов, режем по разделам
+    for b in blocks:
         if len(cur) + len(b) + 2 > 3900 and cur:
             messages.append(cur.strip())
             cur = ""
         cur += b + "\n\n"
     if cur.strip():
         messages.append(cur.strip())
-    for m in messages:
+    return messages
+
+
+def send_telegram(blocks, d):
+    token = os.getenv("TG_TOKEN")
+    chat = d.get("telegram_chat") or os.getenv("TG_CHAT_ID")
+    if not (token and chat):
+        return print("Telegram не настроен, пропускаю")
+    for m in chunk(blocks):
         tg_send(token, chat, m)
         time.sleep(1)
+
+
+def regional_digest(d, reg, now):
+    """Подборка для одного региона по шаблонам regional_topics ({region} и {city} подставляются)."""
+    topics = []
+    for t in d["regional_topics"]:
+        topics.append({**t,
+                       "queries": [q.format(region=reg["name"], city=reg["city"]) for q in t["queries"]],
+                       "feeds": list(t.get("feeds", [])) + (list(reg.get("feeds", [])) if t.get("region_feeds") else [])})
+    title = f"{d.get('regional_title', d['title'])} — {reg['name']}"
+    return build_blocks({**d, "topics": topics, "title": title}, now)
+
+
+def deliver_to_subscribers(d, channel_blocks, now, cfg):
+    """Личная рассылка подписчикам бота: global = та же подборка, regional = своя для каждого региона."""
+    mode = d.get("subscribers")
+    if not mode:
+        return True
+    if os.getenv("GITHUB_ACTIONS") and not storage.configured():
+        print("Подписчики: не заданы секреты GIST_ID и GIST_TOKEN, пропускаю")
+        return False
+    token = os.getenv("TG_TOKEN")
+    users = storage.load()["users"]
+    if not users:
+        print("Подписчиков пока нет")
+        return True
+    regions = cfg.get("bot", {}).get("regions", {})
+    groups = {}
+    for uid, u in users.items():
+        groups.setdefault(u.get("region") if mode == "regional" else "*", []).append(uid)
+    blocked, ok = [], True
+    for key, uids in groups.items():
+        if mode == "regional":
+            reg = regions.get(key)
+            if not reg:
+                continue
+            try:
+                blocks = regional_digest(d, reg, now)
+            except Exception as e:
+                print("Ошибка сборки для региона", key, e)
+                ok = False
+                continue
+        else:
+            blocks = channel_blocks
+        if not blocks:
+            print("Нет новостей для", key)
+            continue
+        messages = chunk(blocks)
+        for uid in uids:
+            try:
+                for m in messages:
+                    tg_send(token, uid, m)
+                    time.sleep(0.5)
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 403:
+                    blocked.append(uid)  # человек заблокировал бота: убираем из подписчиков
+                else:
+                    print("Ошибка отправки подписчику", uid, e)
+                    ok = False
+            time.sleep(0.3)
+    if blocked:
+        state = storage.load()
+        for uid in blocked:
+            state["users"].pop(uid, None)
+        storage.save(state)
+        print("Удалены заблокировавшие бота:", len(blocked))
+    return ok
 
 
 def send_email(blocks, d, now):
@@ -194,26 +270,32 @@ def send_email(blocks, d, now):
         s.sendmail(user, [a.strip() for a in to.split(",")], msg.as_string())
 
 
-def run_digest(name, d, now):
+def run_digest(name, d, now, cfg):
     print(f"== {name}")
+    ok = True
     blocks = build_blocks(d, now)
     if not blocks:
-        print("Нет новостей за период")
-        return False
-    ok = True
-    for channel, fn in (("telegram", lambda: send_telegram(blocks, d)),
-                        ("email", lambda: send_email(blocks, d, now))):
-        if channel in d["channels"]:
-            try:
-                fn()
-            except Exception as e:
-                print(f"Ошибка отправки ({channel}):", e)
-                ok = False
+        print("Нет новостей за период для канала")
+        ok = False
+    else:
+        for channel, fn in (("telegram", lambda: send_telegram(blocks, d)),
+                            ("email", lambda: send_email(blocks, d, now))):
+            if channel in d["channels"]:
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"Ошибка отправки ({channel}):", e)
+                    ok = False
+    try:
+        ok = deliver_to_subscribers(d, blocks, now, cfg) and ok
+    except Exception as e:
+        print("Ошибка личной рассылки:", e)
+        ok = False
     return ok
 
 
 if __name__ == "__main__":
-    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "config.yaml"), encoding="utf-8"))
+    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"), encoding="utf-8"))
     defaults = cfg.get("defaults", {})
     only = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     now = datetime.now(ZoneInfo(defaults.get("timezone", "Asia/Yekaterinburg")))
@@ -225,7 +307,7 @@ if __name__ == "__main__":
                 continue
         elif d.get("days") and DAY_KEYS[now.weekday()] not in d["days"]:
             continue  # сегодня не его день
-        if not run_digest(name, d, now):
+        if not run_digest(name, d, now, cfg):
             failed = True
     if failed:
         sys.exit(1)
