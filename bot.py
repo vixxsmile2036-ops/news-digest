@@ -145,7 +145,14 @@ def handle_admin_callback(cq):
             active.add(slug)
         st["active_regions"] = sorted(active)
         storage.save_settings(st)
-        handle_admin_callback({"id": cq["id"], "from": cq["from"], "message": cq["message"], "data": "adm:regions"})
+        rows = []
+        for region_slug, region in cfg.get("bot", {}).get("regions", {}).items():
+            mark = "✅" if region_slug in active else "⬜"
+            rows.append((f"{mark} {region['name']}", f"adm:region:{region_slug}"))
+        keyboard = [[{"text": label, "callback_data": action}] for label, action in rows]
+        keyboard.append([{"text": "⬅️ В меню", "callback_data": "adm:home"}])
+        tg("sendMessage", chat_id=chat, text="Нажимай на регион, чтобы включать или отключать его в рассылке:",
+           reply_markup={"inline_keyboard": keyboard})
     elif data == "adm:style":
         rows = [("Изменить стиль текста", "adm:styletext"),
                 ("Изменить язык", "adm:language"),
@@ -231,6 +238,9 @@ def handle(u, state):
     parts = text.split(maxsplit=1)
     cmd = parts[0].split("@")[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
+    if cmd == "/myid":
+        tg("sendMessage", chat_id=chat, text=f"Твой Telegram ID: {user_id}")
+        return False
     if cmd == "/admin":
         if is_admin(user_id):
             admin_home(chat)
