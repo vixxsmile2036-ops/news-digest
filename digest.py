@@ -294,8 +294,21 @@ def run_digest(name, d, now, cfg):
     return ok
 
 
+def deep_merge(base, override):
+    """Рекурсивно накладывает пользовательские настройки на config.yaml."""
+    if not isinstance(base, dict) or not isinstance(override, dict):
+        return override
+    result = dict(base)
+    for key, value in override.items():
+        result[key] = deep_merge(result[key], value) if key in result else value
+    return result
+
+
 if __name__ == "__main__":
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"), encoding="utf-8"))
+    runtime = storage.load_settings().get("config", {})
+    if runtime:
+        cfg = deep_merge(cfg, runtime)
     defaults = cfg.get("defaults", {})
     only = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
     now = datetime.now(ZoneInfo(defaults.get("timezone", "Asia/Yekaterinburg")))
