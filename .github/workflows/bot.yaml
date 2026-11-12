@@ -1,0 +1,33 @@
+name: Bot
+on:
+  schedule:
+    # Раз в 5 минут бот забирает нажатия кнопок и команды (/start, /stop, /admin) и отвечает.
+    # GitHub может опаздывать, поэтому ответ приходит с задержкой в несколько минут.
+    # Если репозиторий ПРИВАТНЫЙ, бесплатных минут не хватит: поставь "*/30 * * * *".
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+concurrency:
+  group: bot
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write   # чтобы кнопка «Обновление» в боте могла запускать workflow News digest
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python bot.py --once
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
