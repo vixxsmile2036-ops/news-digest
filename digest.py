@@ -273,6 +273,19 @@ def send_email(blocks, d, now):
         s.sendmail(user, [a.strip() for a in to.split(",")], msg.as_string())
 
 
+def tell_admin(text):
+    """Короткое сообщение главному админу (первый ID из TG_ADMIN_ID). Без секрета молча пропускаем."""
+    token = os.getenv("TG_TOKEN")
+    admin = next((x for x in re.split(r"[,;\s]+", os.getenv("TG_ADMIN_ID", "")) if x), "")
+    if not (token and admin):
+        return
+    try:
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": admin, "text": text, "disable_web_page_preview": True}, timeout=30)
+    except Exception as e:
+        print("Не смогла написать админу:", e)
+
+
 DRAFTS = os.path.join(settings.BASE, "drafts.json")
 
 
@@ -363,7 +376,7 @@ if __name__ == "__main__":
         # сначала отмечаем «сегодня запущено» (если отметить не вышло, ничего не шлём: следующий час попробует снова)
         settings.update(lambda x: x.__setitem__("last_run", today))
         print("Пора слать:", now.isoformat())
-    failed, matched = False, False
+    failed, matched, ran = False, False, []
     for name, raw in cfg["digests"].items():
         d = {**defaults, **raw}
         if only:
@@ -374,8 +387,13 @@ if __name__ == "__main__":
         matched = True
         ok = publish(name, d, now, cfg) if mode == "publish" else run_digest(name, d, now, cfg, mode)
         failed = failed or not ok
+        if ok:
+            ran.append(d["title"])
     if only and not matched:
         print("Дайджест не найден или выключен:", only)
         failed = True
+    if ran and mode == "send" and os.getenv("GITHUB_ACTIONS"):
+        # чтобы не заглядывать в Actions: видно, что автоматическая (или ручная) рассылка ушла
+        tell_admin("✅ Рассылка отправлена: " + "; ".join(ran) + (" (часть выпусков не ушла, смотри Actions)" if failed else ""))
     if failed:
         sys.exit(1)
