@@ -1,0 +1,36 @@
+name: Bot live
+# Запускай вручную, когда настраиваешь бота: он отвечает сразу, без ожидания 5 минут.
+# Через указанное время сам выключается, дальше работает обычный «Bot» с задержкой.
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Сколько минут бот отвечает мгновенно (максимум 25)"
+        required: false
+        default: "15"
+concurrency:
+  group: bot            # та же группа, что у «Bot»: они не работают одновременно и не мешают друг другу
+  cancel-in-progress: false
+permissions:
+  contents: read
+  actions: write
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python bot.py --listen "$MINUTES"
+        env:
+          MINUTES: ${{ github.event.inputs.minutes }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
