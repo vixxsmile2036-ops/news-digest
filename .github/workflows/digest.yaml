@@ -1,0 +1,57 @@
+name: News digest
+on:
+  schedule:
+    # Каждый час. digest.py сам решает, пора ли слать: время берёт из меню бота (или send_time в config.yaml),
+    # окно 3 часа, раз в день. Если GitHub пропустил или задержал запуск, следующий час догонит.
+    - cron: "7 * * * *"
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: "Имя выпуска из config.yaml: monday, wednesday или friday (пусто = всё, что положено на сегодня)"
+        required: false
+        default: ""
+concurrency:
+  group: digest
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Рассылка
+        env:
+          DIGEST: ${{ github.event.inputs.digest }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            python digest.py --scheduled
+          else
+            python digest.py "$DIGEST"
+          fi
+      - name: Написать админу, если рассылка упала
+        if: failure()
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_ADMIN_ID: ${{ secrets.TG_ADMIN_ID }}
+        run: |
+          ADMIN="${TG_ADMIN_ID%%[,; ]*}"
+          curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d chat_id="$ADMIN" \
+            --data-urlencode "text=⚠️ Рассылка не отправилась. Лог: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true
