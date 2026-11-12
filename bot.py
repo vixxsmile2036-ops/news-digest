@@ -2,6 +2,7 @@
   python bot.py --post-menu   # запостить в паблик сообщение с кнопками регионов
   python bot.py               # слушать бота постоянно (на сервере) + сам запускать дайджест по расписанию
   python bot.py --once        # обработать накопившиеся нажатия и выйти (для GitHub Actions)
+  python bot.py --listen 15   # отвечать мгновенно 15 минут и выйти (GitHub Actions, workflow «Bot live»)
 Переменные: TG_TOKEN, TG_ADMIN_ID (твой Telegram ID; узнать: написать боту /myid)."""
 import os, re, sys, json, time, html, threading, subprocess, requests
 from datetime import datetime, timedelta
@@ -467,13 +468,24 @@ def handle(u, state):
     return False
 
 
-def poll(once=False):
+def poll(once=False, until=None):
+    """once: забрать накопившееся и выйти. until (time.time()): слушать до этого момента и выйти.
+    Без обоих: слушать бесконечно (на своём сервере)."""
     offset = None
     while True:
+        wait = 0 if once else 50
+        if until:
+            left = until - time.time()
+            if left <= 0:
+                if offset is not None:
+                    tg("getUpdates", offset=offset, timeout=0)  # подтвердить уже обработанное
+                return
+            wait = max(1, int(min(25, left)))  # не меньше секунды, чтобы не долбить Telegram пустыми запросами
         try:
-            state = storage.load()  # подписчиков мог изменить digest.py, поэтому читаем заново
-            updates = tg("getUpdates", offset=offset, timeout=0 if once else 50,
+            updates = tg("getUpdates", offset=offset, timeout=wait,
                          allowed_updates=["message", "callback_query"])
+            # подписчиков мог изменить digest.py, поэтому читаем заново, но только когда есть что обрабатывать
+            state = storage.load() if updates else None
         except Exception as e:
             print("getUpdates/load error", e)
             if once:
@@ -510,7 +522,27 @@ if __name__ == "__main__":
         if os.getenv("GITHUB_ACTIONS") and not storage.configured():
             sys.exit("Не заданы секреты GIST_ID и GIST_TOKEN: без них подписки не сохранятся")
         once = "--once" in sys.argv
-        if not once and not os.getenv("GITHUB_ACTIONS"):
+        minutes = None
+        if "--listen" in sys.argv:  # режим «на связи»: отвечает мгновенно N минут и выходит (запускается вручную)
+            i = sys.argv.index("--listen")
+            try:
+                minutes = min(float(sys.argv[i + 1]), 25)
+            except (IndexError, ValueError):
+                minutes = 15
+        if not once and minutes is None and not os.getenv("GITHUB_ACTIONS"):
             threading.Thread(target=scheduler, daemon=True).start()
             print("Бот запущен, расписание включено")
-        poll(once=once)
+        if minutes is not None:
+            for a in ADMINS[:1]:
+                try:
+                    tg("sendMessage", chat_id=a, text=f"🟢 Бот на связи ещё {minutes:g} мин, отвечаю сразу. Открой /admin")
+                except Exception as e:
+                    print("hello error", e)
+            poll(until=time.time() + minutes * 60)
+            for a in ADMINS[:1]:
+                try:
+                    tg("sendMessage", chat_id=a, text="⚪ Бот ушёл в обычный режим: теперь отвечает с задержкой в несколько минут.")
+                except Exception as e:
+                    print("bye error", e)
+        else:
+            poll(once=once)
