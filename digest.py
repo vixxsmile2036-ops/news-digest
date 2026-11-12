@@ -1,7 +1,7 @@
 """Новостной дайджест по расписанию: RSS -> LLM-сжатие -> Telegram + e-mail.
 Все настройки в config.yaml. Запуск: `python digest.py` (все дайджесты на сегодня)
 или `python digest.py weekly` (конкретный, независимо от дня)."""
-import os, re, sys, time, html, smtplib, calendar
+import os, re, sys, json, time, html, smtplib, calendar
 from datetime import datetime
 from email.mime.text import MIMEText
 from urllib.parse import quote
@@ -11,6 +11,7 @@ import feedparser
 import requests
 import yaml
 
+import settings  # первым: подхватывает .env
 import storage
 
 LLM_BASE_URL = os.getenv("LLM_BASE_URL") or "https://api.groq.com/openai/v1"
@@ -212,13 +213,9 @@ def deliver_to_subscribers(d, channel_blocks, now, cfg):
         print("Подписчиков пока нет")
         return True
     regions = cfg.get("bot", {}).get("regions", {})
-    active_regions = set(storage.load_settings().get("active_regions", regions.keys()))
     groups = {}
     for uid, u in users.items():
-        region = u.get("region")
-        if mode == "regional" and (region not in regions or region not in active_regions):
-            continue
-        groups.setdefault(region if mode == "regional" else "*", []).append(uid)
+        groups.setdefault(u.get("region") if mode == "regional" else "*", []).append(uid)
     blocked, ok = [], True
     for key, uids in groups.items():
         if mode == "regional":
@@ -274,10 +271,25 @@ def send_email(blocks, d, now):
         s.sendmail(user, [a.strip() for a in to.split(",")], msg.as_string())
 
 
-def run_digest(name, d, now, cfg):
-    print(f"== {name}")
+DRAFTS = os.path.join(settings.BASE, "drafts.json")
+
+
+def load_drafts():
+    try:
+        with open(DRAFTS, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_drafts(dr):
+    with open(DRAFTS, "w", encoding="utf-8") as f:
+        json.dump(dr, f, ensure_ascii=False, indent=1)
+
+
+def deliver(name, d, blocks, now, cfg):
+    """Реальная отправка: канал, почта, личная рассылка подписчикам."""
     ok = True
-    blocks = build_blocks(d, now)
     if not blocks:
         print("Нет новостей за период для канала")
         ok = False
@@ -298,25 +310,46 @@ def run_digest(name, d, now, cfg):
     return ok
 
 
-def deep_merge(base, override):
-    """Рекурсивно накладывает пользовательские настройки на config.yaml."""
-    if not isinstance(base, dict) or not isinstance(override, dict):
-        return override
-    result = dict(base)
-    for key, value in override.items():
-        result[key] = deep_merge(result[key], value) if key in result else value
-    return result
+def run_digest(name, d, now, cfg, mode="send"):
+    """mode=send: собрать и сразу отправить. mode=draft: собрать и сохранить черновик в drafts.json."""
+    print(f"== {name}")
+    blocks = build_blocks(d, now)
+    if mode == "draft":
+        if not blocks:
+            print("Нет новостей за период, черновик не создан")
+            return False
+        dr = load_drafts()
+        dr[name] = {"blocks": blocks, "created": now.isoformat()}
+        save_drafts(dr)
+        print("Черновик готов:", name)
+        return True
+    return deliver(name, d, blocks, now, cfg)
+
+
+def publish(name, d, now, cfg):
+    """Отправить ранее собранный и одобренный черновик."""
+    print(f"== публикация {name}")
+    dr = load_drafts()
+    item = dr.get(name)
+    if not item:
+        print("Черновика нет, соберите заново")
+        return False
+    ok = deliver(name, d, item["blocks"], now, cfg)
+    if ok:
+        dr.pop(name, None)
+        save_drafts(dr)
+    return ok
 
 
 if __name__ == "__main__":
-    cfg = yaml.safe_load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"), encoding="utf-8"))
-    runtime = storage.load_settings().get("config", {})
-    if runtime:
-        cfg = deep_merge(cfg, runtime)
+    cfg = settings.effective_cfg()  # config.yaml + то, что настроено кнопками в боте
     defaults = cfg.get("defaults", {})
-    only = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else None
+    flags = [a for a in sys.argv[1:] if a.startswith("--")]
+    pos = [a for a in sys.argv[1:] if not a.startswith("--")]
+    only = pos[0] if pos else None
+    mode = "publish" if "--publish" in flags else "draft" if "--draft" in flags else "send"
     now = datetime.now(ZoneInfo(defaults.get("timezone", "Asia/Yekaterinburg")))
-    failed = False
+    failed, matched = False, False
     for name, raw in cfg["digests"].items():
         d = {**defaults, **raw}
         if only:
@@ -324,7 +357,11 @@ if __name__ == "__main__":
                 continue
         elif d.get("days") and DAY_KEYS[now.weekday()] not in d["days"]:
             continue  # сегодня не его день
-        if not run_digest(name, d, now, cfg):
-            failed = True
+        matched = True
+        ok = publish(name, d, now, cfg) if mode == "publish" else run_digest(name, d, now, cfg, mode)
+        failed = failed or not ok
+    if only and not matched:
+        print("Дайджест не найден или выключен:", only)
+        failed = True
     if failed:
         sys.exit(1)

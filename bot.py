@@ -1,274 +1,432 @@
-"""Telegram-бот подписок и приватная админ-панель управления дайджестом."""
-import os, sys, time, yaml, requests, subprocess
-from datetime import datetime
+"""Бот: подписка по регионам + админ-меню настроек в Telegram + расписание рассылки.
+  python bot.py --post-menu   # запостить в паблик сообщение с кнопками регионов
+  python bot.py               # слушать бота постоянно (на сервере) + сам запускать дайджест по расписанию
+  python bot.py --once        # обработать накопившиеся нажатия и выйти (для GitHub Actions)
+Переменные: TG_TOKEN, TG_ADMIN_ID (твой Telegram ID; узнать: написать боту /myid)."""
+import os, re, sys, json, time, html, threading, subprocess, requests
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import settings
 import storage
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
 TOKEN = os.environ["TG_TOKEN"]
+ADMIN_ID = os.getenv("TG_ADMIN_ID", "").strip()
+ADMINS = [x for x in re.split(r"[,;\s]+", ADMIN_ID) if x]  # можно несколько ID через запятую
 API = f"https://api.telegram.org/bot{TOKEN}"
-BASE_CFG = yaml.safe_load(open(os.path.join(ROOT, "config.yaml"), encoding="utf-8"))
-ADMIN_IDS = {x.strip() for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip()}
+BASE = settings.BASE
+DRAFTS = os.path.join(BASE, "drafts.json")
 
 
-def config():
-    """Конфигурация с наложенными настройками из приватного хранилища."""
-    cfg = yaml.safe_load(open(os.path.join(ROOT, "config.yaml"), encoding="utf-8"))
-    override = storage.load_settings().get("config", {})
-    def merge(a, b):
-        if not isinstance(a, dict) or not isinstance(b, dict):
-            return b
-        out = dict(a)
-        for k, v in b.items():
-            out[k] = merge(out[k], v) if k in out else v
-        return out
-    return merge(cfg, override)
+def admins():
+    """Главные админы (из TG_ADMIN_ID) + добавленные через /addadmin."""
+    return ADMINS + [x for x in settings.load().get("admins", []) if x not in ADMINS]
+
+
+def is_admin(uid):
+    return str(uid) in admins()
+
+
+def who(uid):
+    """Имя человека, если он уже писал боту."""
+    try:
+        c = tg("getChat", chat_id=uid)
+        name = c.get("first_name") or ""
+        return (name + (f" @{c['username']}" if c.get("username") else "")).strip()
+    except Exception:
+        return ""
+
+
+def add_admin(target):
+    settings.update(lambda s: s.__setitem__("admins", s["admins"] + [target]) if target not in s["admins"] else None)
+
+
+def remove_admin(target):
+    settings.update(lambda s: s.__setitem__("admins", [x for x in s["admins"] if x != target]))
+KEYS = ("news_per_topic", "emoji_per_news", "show_date", "send_time")
 
 
 def tg(method, **params):
     params = {k: v for k, v in params.items() if v is not None}
     r = requests.post(f"{API}/{method}", json=params, timeout=70)
     r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(data)
-    return data["result"]
+    return r.json()["result"]
 
 
-def is_admin(user_id):
-    return str(user_id) in ADMIN_IDS
+# ---------- регионы и подписки ----------
+
+def bot_cfg():
+    return settings.raw_cfg()["bot"]
 
 
-def settings():
-    data = storage.load_settings()
-    data.setdefault("config", {})
-    data.setdefault("pending", {})
-    data.setdefault("active_regions", list(BASE_CFG.get("bot", {}).get("regions", {}).keys()))
-    return data
+def regions():
+    return settings.effective_cfg().get("bot", {}).get("regions", {})
 
 
-def set_path(root, path, value):
-    cur = root
-    for key in path[:-1]:
-        cur = cur.setdefault(key, {})
-    cur[path[-1]] = value
-
-
-def admin_kb():
-    return {"inline_keyboard": [
-        [{"text": "📰 Новости", "callback_data": "adm:news"},
-         {"text": "🎭 Афиша", "callback_data": "adm:afisha"}],
-        [{"text": "🌍 Регионы", "callback_data": "adm:regions"},
-         {"text": "✍️ Оформление", "callback_data": "adm:style"}],
-        [{"text": "🔢 Количество", "callback_data": "adm:count"},
-         {"text": "🔄 Обновление", "callback_data": "adm:update"}],
-    ]}
-
-
-def admin_home(chat, edit=False, message_id=None):
-    text = "⚙️ <b>Управление ботом</b>\n\nПривет! Что будем настраивать?"
-    if edit and message_id:
-        tg("editMessageText", chat_id=chat, message_id=message_id, text=text,
-           parse_mode="HTML", reply_markup=admin_kb())
-    else:
-        tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML", reply_markup=admin_kb())
-
-
-def send_admin_list(chat, title, rows, back="home"):
-    keyboard = [[{"text": label, "callback_data": data}] for label, data in rows]
-    keyboard.append([{"text": "⬅️ В меню", "callback_data": "adm:home"}])
-    tg("sendMessage", chat_id=chat, text=title, reply_markup={"inline_keyboard": keyboard})
-
-
-def prompt(chat, text, path, kind="text"):
-    st = settings()
-    st["pending"][str(chat)] = {"path": path, "kind": kind}
-    storage.save_settings(st)
-    tg("sendMessage", chat_id=chat, text=text + "\n\nОтправь новое значение сообщением. Для отмены напиши /cancel.")
-
-
-def handle_admin_callback(cq):
-    user_id = cq["from"]["id"]
-    chat = cq["message"]["chat"]["id"]
-    mid = cq["message"]["message_id"]
-    data = cq.get("data", "")
-    tg("answerCallbackQuery", callback_query_id=cq["id"])
-    if not is_admin(user_id):
-        return
-    cfg = config()
-    if data == "adm:home":
-        admin_home(chat, True, mid)
-    elif data == "adm:news":
-        rows = [(f"📰 {name}", f"adm:topics:{name}") for name in cfg.get("digests", {})]
-        send_admin_list(chat, "Выбери выпуск для редактирования источников и категорий:", rows)
-    elif data.startswith("adm:topics:"):
-        name = data.split(":", 2)[2]
-        topics = cfg.get("digests", {}).get(name, {}).get("topics", [])
-        rows = [(t.get("name", f"Раздел {i+1}"), f"adm:topic:{name}:{i}") for i, t in enumerate(topics)]
-        send_admin_list(chat, f"Разделы выпуска «{name}»:\nВыбери раздел, чтобы изменить поисковые запросы.", rows)
-    elif data.startswith("adm:topic:"):
-        _, _, name, idx = data.split(":", 3)
-        topic = cfg["digests"][name]["topics"][int(idx)]
-        path = ["digests", name, "topics", int(idx), "queries"]
-        prompt(chat, f"Текущие запросы раздела «{topic.get('name','')}»:\n" +
-               "\n".join(topic.get("queries", [])) +
-               "\n\nОтправь новые запросы, каждый с новой строки.", path, "lines")
-    elif data == "adm:afisha":
-        choices = [(f"🎭 {name}", f"adm:afishatopics:{name}") for name, d in cfg.get("digests", {}).items() if d.get("regional_topics")]
-        send_admin_list(chat, "Выбери выпуск с региональной афишей:", choices)
-    elif data.startswith("adm:afishatopics:"):
-        name = data.split(":", 2)[2]
-        topics = cfg["digests"][name].get("regional_topics", [])
-        rows = [(t.get("name", f"Раздел {i+1}"), f"adm:afishatopic:{name}:{i}") for i, t in enumerate(topics)]
-        send_admin_list(chat, "Выбери раздел афиши для редактирования запросов:", rows)
-    elif data.startswith("adm:afishatopic:"):
-        _, _, name, idx = data.split(":", 3)
-        topic = cfg["digests"][name]["regional_topics"][int(idx)]
-        prompt(chat, f"Текущие запросы «{topic.get('name','')}»:\n" +
-               "\n".join(topic.get("queries", [])) +
-               "\n\nОтправь новые запросы, каждый с новой строки.",
-               ["digests", name, "regional_topics", int(idx), "queries"], "lines")
-    elif data == "adm:regions":
-        st = settings()
-        active = set(st["active_regions"])
-        rows = []
-        for slug, region in cfg.get("bot", {}).get("regions", {}).items():
-            mark = "✅" if slug in active else "⬜"
-            rows.append((f"{mark} {region['name']}", f"adm:region:{slug}"))
-        send_admin_list(chat, "Нажимай на регион, чтобы включать или отключать его в рассылке:", rows)
-    elif data.startswith("adm:region:"):
-        slug = data.split(":", 2)[2]
-        st = settings()
-        active = set(st["active_regions"])
-        if slug in active:
-            active.remove(slug)
+def menu_keyboard(url_buttons=False, username=None):
+    rows = []
+    for slug, r in regions().items():
+        text = f"📍 {r['name']}"
+        if url_buttons:
+            rows.append([{"text": text, "url": f"https://t.me/{username}?start={slug}"}])
         else:
-            active.add(slug)
-        st["active_regions"] = sorted(active)
-        storage.save_settings(st)
+            rows.append([{"text": text, "callback_data": f"r:{slug}"}])
+    return {"inline_keyboard": rows}
+
+
+def subscribe(state, chat, slug):
+    regs = regions()
+    if slug not in regs:
+        tg("sendMessage", chat_id=chat, text="Этот регион сейчас недоступен. Выбрать другой: /start")
+        return False
+    old = state["users"].get(str(chat), {})
+    state["users"][str(chat)] = {"region": slug, "since": old.get("since") or datetime.now().strftime("%Y-%m-%d")}
+    tg("sendMessage", chat_id=chat, text=bot_cfg()["welcome_text"].format(region=regs[slug]["name"]))
+    return True
+
+
+# ---------- админ-меню ----------
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def onoff(flag):
+    return "✅" if flag else "⬜"
+
+
+BACK = [[btn("⬅️ Назад", "a:main")]]
+
+
+def flat_topics(raw):
+    return [(dn, t) for dn, dd in raw["digests"].items() for t in dd.get("topics", [])]
+
+
+def current(raw, s):
+    d = raw.get("defaults", {})
+    ov = {k: d.get(k) for k in KEYS}
+    ov.update(s["overrides"])
+    ov["send_time"] = ov.get("send_time") or "09:00"
+    return ov
+
+
+def screen(name, uid=""):
+    raw, s = settings.raw_cfg(), settings.load()
+    ov = current(raw, s)
+    digests = list(raw["digests"].items())
+
+    if name == "news":
         rows = []
-        for region_slug, region in cfg.get("bot", {}).get("regions", {}).items():
-            mark = "✅" if region_slug in active else "⬜"
-            rows.append((f"{mark} {region['name']}", f"adm:region:{region_slug}"))
-        keyboard = [[{"text": label, "callback_data": action}] for label, action in rows]
-        keyboard.append([{"text": "⬅️ В меню", "callback_data": "adm:home"}])
-        tg("sendMessage", chat_id=chat, text="Нажимай на регион, чтобы включать или отключать его в рассылке:",
-           reply_markup={"inline_keyboard": keyboard})
-    elif data == "adm:style":
-        rows = [("Изменить стиль текста", "adm:styletext"),
-                ("Изменить язык", "adm:language"),
-                ("Переключить эмодзи", "adm:emoji")]
-        send_admin_list(chat, "Настройки оформления публикаций:", rows)
-    elif data == "adm:styletext":
-        prompt(chat, "Напиши новый стиль дайджеста (например: коротко, дружелюбно, без канцелярита).",
-               ["defaults", "style"])
-    elif data == "adm:language":
-        prompt(chat, "Напиши язык публикаций:", ["defaults", "language"])
-    elif data == "adm:emoji":
-        st = settings()
-        current = st["config"].get("defaults", {}).get("emoji_per_news", cfg["defaults"].get("emoji_per_news", True))
-        set_path(st["config"], ["defaults", "emoji_per_news"], not current)
-        storage.save_settings(st)
-        tg("sendMessage", chat_id=chat, text=f"Эмодзи в новостях: {'включены' if not current else 'выключены'}.")
-    elif data == "adm:count":
-        prompt(chat, "Сколько новостей показывать в каждом разделе? Отправь целое число.",
-               ["defaults", "news_per_topic"], "number")
-    elif data == "adm:update":
-        tg("sendMessage", chat_id=chat, text="🔄 Запускаю сбор новостей. Это может занять несколько минут…")
-        result = subprocess.run([sys.executable, os.path.join(ROOT, "digest.py")],
-                                cwd=ROOT, capture_output=True, text=True, timeout=1700)
-        tail = (result.stdout + "\n" + result.stderr)[-3000:]
-        tg("sendMessage", chat_id=chat,
-           text=("✅ Сбор завершён." if result.returncode == 0 else "⚠️ Сбор завершился с ошибкой.") +
-                ("\n\n" + tail if tail.strip() else ""))
+        for i, (dn, t) in enumerate(flat_topics(raw)):
+            on = settings.topic_key(dn, t["name"]) not in s["off_topics"]
+            rows.append([btn(f"{onoff(on)} {t.get('emoji', '📌')} {t['name']} · {dn}", f"a:t:{i}")])
+        return "📰 Новости\nКакие разделы включать в рассылку:", rows + BACK
+
+    if name == "dig":
+        rows = []
+        for i, (dn, dd) in enumerate(digests):
+            days = ", ".join(dd.get("days") or raw.get("defaults", {}).get("days") or []) or "каждый день"
+            rows.append([btn(f"{onoff(dn not in s['off_digests'])} {dn} ({days})", f"a:d:{i}")])
+        rows.append([btn(f"{onoff(s.get('approval', True))} Сначала присылать мне на проверку", "a:ap")])
+        rows.append([btn(f"🕘 Время отправки: {ov['send_time']}", "a:time")])
+        return "🎭 Рассылки\nКакие дайджесты отправлять и во сколько:", rows + BACK
+
+    if name == "time":
+        opts = ["07:00", "08:00", "09:00", "10:00", "12:00", "18:00"]
+        rows = [[btn(("✅ " if o == ov["send_time"] else "") + o, f"a:tm:{o}") for o in opts[i:i + 3]]
+                for i in range(0, len(opts), 3)]
+        return "🕘 Во сколько отправлять (по времени из config.yaml)", rows + [[btn("⬅️ Назад", "a:dig")]]
+
+    if name == "reg":
+        rows = [[btn(f"{onoff(slug not in s['off_regions'])} {r['name']}", f"a:g:{slug}")]
+                for slug, r in raw.get("bot", {}).get("regions", {}).items()]
+        return "🌍 Регионы\nЧто показывать в меню выбора региона:", rows + BACK
+
+    if name == "look":
+        rows = [[btn(f"{onoff(ov.get('emoji_per_news'))} Эмодзи у каждой новости", "a:o:emoji_per_news")],
+                [btn(f"{onoff(ov.get('show_date'))} Дата в заголовке", "a:o:show_date")]]
+        return "✍️ Оформление публикаций", rows + BACK
+
+    if name == "num":
+        cur = ov.get("news_per_topic")
+        rows = [[btn(("✅ " if cur == n else "") + str(n), f"a:n:{n}") for n in (3, 5, 7, 10)]]
+        return f"🔢 Сколько новостей в каждом разделе\nСейчас: {cur}", rows + BACK
+
+    if name == "adm":
+        owner = str(uid) in ADMINS
+        lines = [f"👑 {a} {who(a)}".strip() for a in ADMINS]
+        extra = [x for x in s.get("admins", []) if x not in ADMINS]
+        lines += [f"👤 {a} {who(a)}".strip() for a in extra]
+        text = "👥 Админы\n\n" + "\n".join(lines) + "\n\n👑 главный, 👤 добавленный."
+        if owner:
+            text += "\nДобавить: /addadmin ID\nУбрать: кнопкой ниже или /removeadmin ID"
+        rows = [[btn(f"❌ Убрать {a}", f"a:rm:{a}")] for a in extra] if owner else []
+        return text, rows + BACK
+
+    if name == "run":
+        rows = [[btn(f"▶️ {dn}", f"a:go:{i}")] for i, (dn, _) in enumerate(digests)]
+        rows.append([btn("▶️ Всё, что положено на сегодня", "a:go:today")])
+        return "🔄 Обновление\nЗапустить сбор вручную (займёт несколько минут):", rows + BACK
+
+    rows = [[btn("📰 Новости", "a:news"), btn("🎭 Рассылки", "a:dig")],
+            [btn("🌍 Регионы", "a:reg"), btn("✍️ Оформление", "a:look")],
+            [btn("🔢 Количество", "a:num"), btn("🔄 Обновление", "a:run")],
+            [btn("👥 Админы", "a:adm")]]
+    return "⚙️ Управление ботом\nПривет! Что будем настраивать?", rows
+
+
+def show(chat, mid, name, uid=""):
+    text, rows = screen(name, uid)
+    try:
+        tg("editMessageText", chat_id=chat, message_id=mid, text=text, reply_markup={"inline_keyboard": rows})
+    except Exception as e:  # например «message is not modified»
+        print("edit error", e)
+
+
+def flip(lst, x):
+    if x in lst:
+        lst.remove(x)
     else:
+        lst.append(x)
+
+
+def admin_action(data, chat, mid, uid=""):
+    act, _, arg = data.partition(":")
+    raw, s = settings.raw_cfg(), settings.load()
+    digests = list(raw["digests"].items())
+    if act in ("main", "news", "dig", "time", "reg", "look", "num", "run", "adm"):
+        return show(chat, mid, act, uid)
+    if act == "rm":
+        if str(uid) in ADMINS:
+            remove_admin(arg)
+        return show(chat, mid, "adm", uid)
+    if act == "t":
+        dn, t = flat_topics(raw)[int(arg)]
+        settings.update(lambda s: flip(s["off_topics"], settings.topic_key(dn, t["name"])))
+        return show(chat, mid, "news")
+    if act == "d":
+        settings.update(lambda s: flip(s["off_digests"], digests[int(arg)][0]))
+        return show(chat, mid, "dig")
+    if act == "tm":
+        settings.update(lambda s: s["overrides"].__setitem__("send_time", arg))
+        return show(chat, mid, "dig")
+    if act == "g":
+        settings.update(lambda s: flip(s["off_regions"], arg))
+        return show(chat, mid, "reg")
+    if act == "o" and arg in ("emoji_per_news", "show_date"):
+        new = not current(raw, s).get(arg)
+        settings.update(lambda s: s["overrides"].__setitem__(arg, new))
+        return show(chat, mid, "look")
+    if act == "n":
+        settings.update(lambda s: s["overrides"].__setitem__("news_per_topic", int(arg)))
+        return show(chat, mid, "num")
+    if act == "ap":
+        settings.update(lambda s: s.__setitem__("approval", not s.get("approval", True)))
+        return show(chat, mid, "dig")
+    if act == "go":
+        approval = s.get("approval", True)
+        args = [] if arg == "today" else [digests[int(arg)][0]]
+        if approval:
+            args = ["--draft"] + args
+        if run_digest_proc(args, chat, "✅ Отправлено"):
+            tg("sendMessage", chat_id=chat, text=("⏳ Собираю черновик, это займёт несколько минут. Пришлю его на проверку."
+                                                  if approval else "⏳ Запустила. Пришлю отчёт, когда закончу."))
+        else:
+            tg("sendMessage", chat_id=chat, text="Сбор уже идёт, подожди пару минут.")
+        return
+    if act in ("pub", "no"):
+        name = digests[int(arg)][0]
+        if act == "no":
+            dr = load_drafts()
+            dr.pop(name, None)
+            save_drafts(dr)
+            return edit_text(chat, mid, f"❌ «{name}»: отменено, в паблик ничего не ушло.")
+        edit_text(chat, mid, f"⏳ Публикую «{name}»…")
+        if not run_digest_proc(["--publish", name], chat, f"✅ «{name}» опубликован"):
+            tg("sendMessage", chat_id=chat, text="Сейчас идёт другой сбор, нажми «Опубликовать» через пару минут.")
         return
 
 
-def handle(u, state):
-    cq = u.get("callback_query")
-    if cq:
-        if cq.get("data", "").startswith("adm:"):
-            handle_admin_callback(cq)
-            return False
-        tg("answerCallbackQuery", callback_query_id=cq["id"])
-        data, chat = cq.get("data", ""), cq["message"]["chat"]["id"]
-        cfg = config()
-        regions = cfg.get("bot", {}).get("regions", {})
-        active = set(settings()["active_regions"])
-        if data.startswith("r:") and data[2:] in regions and data[2:] in active:
-            old = state["users"].get(str(chat), {})
-            state["users"][str(chat)] = {"region": data[2:], "since": old.get("since") or datetime.now().strftime("%Y-%m-%d")}
-            tg("sendMessage", chat_id=chat, text=cfg["bot"]["welcome_text"].format(region=regions[data[2:]]["name"]))
-            return True
+# ---------- запуск дайджеста и расписание ----------
+
+_run_lock = threading.Lock()
+
+
+def load_drafts():
+    try:
+        with open(DRAFTS, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def save_drafts(dr):
+    with open(DRAFTS, "w", encoding="utf-8") as f:
+        json.dump(dr, f, ensure_ascii=False, indent=1)
+
+
+def edit_text(chat, mid, text):
+    try:
+        tg("editMessageText", chat_id=chat, message_id=mid, text=text)
+    except Exception as e:
+        print("edit error", e)
+
+
+def chunk(blocks):
+    messages, cur = [], ""
+    for b_ in blocks:
+        if len(cur) + len(b_) + 2 > 3900 and cur:
+            messages.append(cur.strip())
+            cur = ""
+        cur += b_ + "\n\n"
+    if cur.strip():
+        messages.append(cur.strip())
+    return messages
+
+
+def send_html(chat, text):
+    try:
+        tg("sendMessage", chat_id=chat, text=text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception:
+        tg("sendMessage", chat_id=chat, text=html.unescape(re.sub(r"<[^>]+>", "", text)), disable_web_page_preview=True)
+
+
+def send_drafts(chat):
+    """Присылает админу черновики и кнопки «Опубликовать / Заново / Отмена»."""
+    drafts = load_drafts()
+    names = list(settings.raw_cfg()["digests"])
+    shown = 0
+    for name, dr in drafts.items():
+        if name not in names:
+            continue
+        i = names.index(name)
+        for m in chunk(dr["blocks"]):
+            send_html(chat, m)
+        kb = {"inline_keyboard": [[btn("✅ Опубликовать", f"a:pub:{i}")],
+                                  [btn("🔄 Собрать заново", f"a:go:{i}"), btn("❌ Отмена", f"a:no:{i}")]]}
+        tg("sendMessage", chat_id=chat, text=f"👆 Это черновик «{name}». Публикуем в паблик?", reply_markup=kb)
+        shown += 1
+    if not shown:
+        tg("sendMessage", chat_id=chat, text="Черновиков нет: либо сегодня нет подходящего дайджеста, либо не нашлось новостей.")
+
+
+def run_digest_proc(args, chat, ok_text="✅ Готово"):
+    """digest.py в отдельном процессе, чтобы бот продолжал отвечать на кнопки."""
+    if not _run_lock.acquire(blocking=False):
         return False
 
+    def job():
+        ok = False
+        try:
+            p = subprocess.run([sys.executable, os.path.join(BASE, "digest.py"), *args],
+                               capture_output=True, text=True, cwd=BASE, timeout=3600)
+            ok = p.returncode == 0
+            out = (p.stdout + p.stderr).strip()[-700:]
+            msg = ok_text if ok else "⚠️ Не получилось. Вот что пишет лог:\n\n" + out
+        except Exception as e:
+            msg = f"⚠️ Не удалось запустить сбор: {e}"
+        finally:
+            _run_lock.release()
+        if not chat:
+            return
+        try:
+            if ok and "--draft" in args:
+                send_drafts(chat)
+            else:
+                tg("sendMessage", chat_id=chat, text=msg)
+        except Exception as e:
+            print("report error", e)
+
+    threading.Thread(target=job, daemon=True).start()
+    return True
+
+
+def scheduler():
+    """Раз в день в заданное время собирает дайджест (черновик на проверку или сразу отправка)."""
+    while True:
+        try:
+            cfg, s = settings.effective_cfg(), settings.load()
+            tz = ZoneInfo(cfg.get("defaults", {}).get("timezone", "Asia/Yekaterinburg"))
+            now = datetime.now(tz)
+            h, m = map(int, (s["overrides"].get("send_time") or cfg["defaults"].get("send_time") or "09:00").split(":"))
+            start = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            today = now.strftime("%Y-%m-%d")
+            if s.get("last_run") != today and start <= now < start + timedelta(hours=3):
+                settings.update(lambda st: st.__setitem__("last_run", today))
+                draft = s.get("approval", True) and bool(ADMINS)
+                print("Расписание: запускаю", "черновик" if draft else "дайджест", now)
+                run_digest_proc(["--draft"] if draft else [], ADMINS[0] if ADMINS else None, "✅ Дайджест отправлен")
+        except Exception as e:
+            print("scheduler error", e)
+        time.sleep(30)
+
+
+# ---------- обработка сообщений ----------
+
+def handle(u, state):
+    """Обрабатывает одно обновление. True, если список подписчиков изменился."""
+    cq = u.get("callback_query")
+    if cq:
+        tg("answerCallbackQuery", callback_query_id=cq["id"])
+        data, chat = cq.get("data", ""), cq["message"]["chat"]["id"]
+        if data.startswith("a:"):
+            if is_admin(cq["from"]["id"]):
+                admin_action(data[2:], chat, cq["message"]["message_id"], cq["from"]["id"])
+            return False
+        if data.startswith("r:"):
+            return subscribe(state, chat, data[2:])
+        return False
     msg = u.get("message") or {}
     if (msg.get("chat") or {}).get("type") != "private":
         return False
     text, chat = msg.get("text", ""), msg["chat"]["id"]
-    user_id = msg.get("from", {}).get("id")
-    if not text:
-        return False
-
-    st = settings()
-    pending = st["pending"].get(str(chat))
-    if pending and not text.startswith("/"):
-        value = text.strip()
-        if pending["kind"] == "lines":
-            value = [line.strip() for line in value.splitlines() if line.strip()]
-            if not value:
-                tg("sendMessage", chat_id=chat, text="Список пустой — ничего не изменено.")
-                return False
-        elif pending["kind"] == "number":
-            try:
-                value = int(value)
-                if not 1 <= value <= 30:
-                    raise ValueError()
-            except ValueError:
-                tg("sendMessage", chat_id=chat, text="Нужно целое число от 1 до 30. Попробуй ещё раз или /cancel.")
-                return False
-        set_path(st["config"], pending["path"], value)
-        st["pending"].pop(str(chat), None)
-        storage.save_settings(st)
-        tg("sendMessage", chat_id=chat, text="✅ Сохранено! Изменения применятся к следующим выпускам.")
-        return False
-
     if not text.startswith("/"):
         return False
     parts = text.split(maxsplit=1)
-    cmd = parts[0].split("@")[0]
-    arg = parts[1].strip() if len(parts) > 1 else ""
+    cmd, arg = parts[0].split("@")[0], (parts[1].strip() if len(parts) > 1 else "")
+    uid = str((msg.get("from") or {}).get("id", ""))
     if cmd == "/myid":
-        tg("sendMessage", chat_id=chat, text=f"Твой Telegram ID: {user_id}")
+        tg("sendMessage", chat_id=chat, text=f"Твой Telegram ID: {uid}\nПропиши его в переменной TG_ADMIN_ID на сервере.")
         return False
     if cmd == "/admin":
-        if is_admin(user_id):
-            admin_home(chat)
+        if not ADMINS:
+            tg("sendMessage", chat_id=chat, text=f"Не задана переменная TG_ADMIN_ID. Твой ID: {uid}")
+        elif is_admin(uid):
+            text_, rows = screen("main")
+            tg("sendMessage", chat_id=chat, text=text_, reply_markup={"inline_keyboard": rows})
+        return False
+    if cmd in ("/addadmin", "/removeadmin"):
+        if uid not in ADMINS:  # управлять админами могут только главные
+            return False
+        target = re.sub(r"\D", "", arg)
+        if not target:
+            tg("sendMessage", chat_id=chat, text=f"Напиши так: {cmd} 123456789\nID человека он узнаёт командой /myid у бота.")
+        elif cmd == "/addadmin":
+            if target in admins():
+                tg("sendMessage", chat_id=chat, text="Этот человек уже админ.")
+            else:
+                add_admin(target)
+                note = ""
+                try:
+                    tg("sendMessage", chat_id=target, text="Тебя добавили админом бота. Напиши /admin, чтобы открыть меню.")
+                except Exception:
+                    note = "\nЕму пока не удалось написать: пусть нажмёт у бота «Старт», потом /admin."
+                tg("sendMessage", chat_id=chat, text=f"✅ Админ {target} добавлен.{note}")
+        elif target in ADMINS:
+            tg("sendMessage", chat_id=chat, text="Главного админа убрать нельзя, он задан на сервере (TG_ADMIN_ID).")
+        elif target in admins():
+            remove_admin(target)
+            tg("sendMessage", chat_id=chat, text=f"✅ Админ {target} убран.")
         else:
-            print("Blocked non-admin /admin from", user_id)
+            tg("sendMessage", chat_id=chat, text="Такого админа нет в списке.")
         return False
-    if cmd == "/cancel":
-        if str(chat) in st["pending"]:
-            st["pending"].pop(str(chat), None)
-            storage.save_settings(st)
-            tg("sendMessage", chat_id=chat, text="Редактирование отменено.")
-        return False
-
-    cfg = config()
-    regions = cfg.get("bot", {}).get("regions", {})
-    active = set(settings()["active_regions"])
-    if cmd == "/start" and arg in regions and arg in active:
-        old = state["users"].get(str(chat), {})
-        state["users"][str(chat)] = {"region": arg, "since": old.get("since") or datetime.now().strftime("%Y-%m-%d")}
-        tg("sendMessage", chat_id=chat, text=cfg["bot"]["welcome_text"].format(region=regions[arg]["name"]))
-        return True
+    regs = regions()
+    if cmd == "/start" and arg in regs:
+        return subscribe(state, chat, arg)
     if cmd in ("/start", "/regions"):
         cur = state["users"].get(str(chat))
-        note = f"\nСейчас выбран: {regions[cur['region']]['name']}" if cur and cur.get("region") in regions else ""
-        rows = [[{"text": f"📍 {r['name']}", "callback_data": f"r:{slug}"}]
-                for slug, r in regions.items() if slug in active]
-        tg("sendMessage", chat_id=chat, text=cfg["bot"]["choose_text"] + note,
-           reply_markup={"inline_keyboard": rows})
+        note = f"\nСейчас выбран: {regs[cur['region']]['name']}" if cur and cur.get("region") in regs else ""
+        tg("sendMessage", chat_id=chat, text=bot_cfg()["choose_text"] + note, reply_markup=menu_keyboard())
         return False
     if cmd == "/stop":
         if state["users"].pop(str(chat), None) is not None:
@@ -282,7 +440,7 @@ def poll(once=False):
     offset = None
     while True:
         try:
-            state = storage.load()
+            state = storage.load()  # подписчиков мог изменить digest.py, поэтому читаем заново
             updates = tg("getUpdates", offset=offset, timeout=0 if once else 50,
                          allowed_updates=["message", "callback_query"])
         except Exception as e:
@@ -299,7 +457,7 @@ def poll(once=False):
             except Exception as e:
                 print("handle error", e)
         if changed:
-            storage.save(state)
+            storage.save(state)  # сначала сохраняем, потом подтверждаем обновления
         if once:
             if updates:
                 tg("getUpdates", offset=offset, timeout=0)
@@ -307,13 +465,10 @@ def poll(once=False):
 
 
 def post_menu():
-    cfg = config()
     username = tg("getMe")["username"]
-    chat = cfg["bot"].get("channel") or os.environ["TG_CHAT_ID"]
-    rows = [[{"text": f"📍 {r['name']}", "url": f"https://t.me/{username}?start={slug}"}]
-            for slug, r in cfg["bot"]["regions"].items() if slug in settings()["active_regions"]]
-    tg("sendMessage", chat_id=chat, text=cfg["bot"]["menu_text"],
-       reply_markup={"inline_keyboard": rows})
+    chat = bot_cfg().get("channel") or os.environ["TG_CHAT_ID"]
+    tg("sendMessage", chat_id=chat, text=bot_cfg()["menu_text"],
+       reply_markup=menu_keyboard(url_buttons=True, username=username))
     print("Меню опубликовано")
 
 
@@ -322,5 +477,9 @@ if __name__ == "__main__":
         post_menu()
     else:
         if os.getenv("GITHUB_ACTIONS") and not storage.configured():
-            sys.exit("Не заданы секреты GIST_ID и GIST_TOKEN: без них настройки и подписки не сохранятся")
-        poll(once="--once" in sys.argv)
+            sys.exit("Не заданы секреты GIST_ID и GIST_TOKEN: без них подписки не сохранятся")
+        once = "--once" in sys.argv
+        if not once and not os.getenv("GITHUB_ACTIONS"):
+            threading.Thread(target=scheduler, daemon=True).start()
+            print("Бот запущен, расписание включено")
+        poll(once=once)
