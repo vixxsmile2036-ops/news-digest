@@ -16,6 +16,24 @@ ADMINS = [x for x in re.split(r"[,;\s]+", ADMIN_ID) if x]  # можно неск
 API = f"https://api.telegram.org/bot{TOKEN}"
 BASE = settings.BASE
 DRAFTS = os.path.join(BASE, "drafts.json")
+ON_GITHUB = bool(os.getenv("GITHUB_ACTIONS"))
+
+
+def dispatch_digest(name):
+    """На GitHub: запустить workflow «News digest» вручную (name пустое = всё, что положено на сегодня)."""
+    repo, token = os.getenv("GITHUB_REPOSITORY"), os.getenv("GH_TOKEN")
+    if not (repo and token):
+        raise RuntimeError("нет GITHUB_REPOSITORY или GH_TOKEN")
+    h = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    base = f"https://api.github.com/repos/{repo}/actions/workflows"
+    r = requests.get(base, headers=h, timeout=30)
+    r.raise_for_status()
+    wf = next((w for w in r.json().get("workflows", []) if w.get("name") == "News digest"), None)
+    if not wf:
+        raise RuntimeError("не нашла workflow «News digest»")
+    r = requests.post(f"{base}/{wf['id']}/dispatches", headers=h, timeout=30,
+                      json={"ref": os.getenv("GITHUB_REF_NAME") or "main", "inputs": {"digest": name}})
+    r.raise_for_status()
 
 
 def admins():
@@ -196,6 +214,19 @@ def admin_action(data, chat, mid, uid=""):
     digests = list(raw["digests"].items())
     if act in ("main", "news", "dig", "time", "reg", "look", "num", "run", "adm"):
         return show(chat, mid, act, uid)
+    if ON_GITHUB and act in ("go", "pub", "no"):
+        # на GitHub бот живёт пару секунд, сам собирать новости не может: запускаем workflow
+        if act == "go":
+            try:
+                dispatch_digest("" if arg == "today" else digests[int(arg)][0])
+                text = ("⏳ Запустила сбор на GitHub. Рассылка уйдёт сразу в паблик и подписчикам, "
+                        "обычно через несколько минут. Если не придёт: GitHub → Actions → News digest.")
+            except Exception as e:
+                text = f"⚠️ Не получилось запустить: {e}"
+        else:
+            text = "Черновики больше не используются: рассылка уходит сама."
+        tg("sendMessage", chat_id=chat, text=text)
+        return
     if act == "rm":
         if str(uid) in ADMINS:
             remove_admin(arg)

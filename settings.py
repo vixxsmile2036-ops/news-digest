@@ -1,7 +1,9 @@
 """Настройки, которые меняются кнопками в Telegram.
-Лежат в settings.json рядом со скриптами. config.yaml остаётся «заводскими» настройками,
+Если заданы секреты GIST_ID и GIST_TOKEN (так на GitHub), лежат в файле settings.json секретного Gist,
+рядом с подписчиками, и переживают перезапуски. Иначе (свой компьютер, сервер) лежат в settings.json
+рядом со скриптами. config.yaml остаётся «заводскими» настройками,
 а settings.json поверх него включает/выключает разделы, регионы, рассылки и меняет параметры."""
-import os, json, copy, threading, yaml
+import os, json, copy, threading, requests, yaml
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 PATH = os.path.join(BASE, "settings.json")
@@ -35,17 +37,56 @@ def raw_cfg():
         return yaml.safe_load(f)
 
 
-def load():
-    s = copy.deepcopy(EMPTY)
+def _gist():
+    gid, token = os.getenv("GIST_ID"), os.getenv("GIST_TOKEN")
+    if gid and token:
+        return (f"https://api.github.com/gists/{gid}",
+                {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"})
+    return None
+
+
+def _read_local():
     try:
         with open(PATH, encoding="utf-8") as f:
-            s.update(json.load(f))
+            return json.load(f)
     except (FileNotFoundError, ValueError):
-        pass
+        return {}
+
+
+def _read_gist(g):
+    """Ошибки сети НЕ глушим: иначе при сбое настройки сбросились бы на заводские и перезаписались."""
+    url, headers = g
+    r = requests.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    f = r.json().get("files", {}).get("settings.json")
+    if not f:
+        return _read_local()  # в Gist настроек ещё нет: берём локальные, если они есть
+    text = f.get("content")
+    if f.get("truncated"):
+        text = requests.get(f["raw_url"], headers=headers, timeout=30).text
+    try:
+        return json.loads(text or "{}")
+    except ValueError:
+        return {}
+
+
+def load():
+    s = copy.deepcopy(EMPTY)
+    g = _gist()
+    data = _read_gist(g) if g else _read_local()
+    if isinstance(data, dict):
+        s.update(data)
     return s
 
 
 def save(s):
+    g = _gist()
+    if g:
+        url, headers = g
+        text = json.dumps(s, ensure_ascii=False, indent=1)
+        r = requests.patch(url, headers=headers, json={"files": {"settings.json": {"content": text}}}, timeout=30)
+        r.raise_for_status()
+        return
     tmp = PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=1)

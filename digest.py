@@ -1,8 +1,10 @@
 """Новостной дайджест по расписанию: RSS -> LLM-сжатие -> Telegram + e-mail.
 Все настройки в config.yaml. Запуск: `python digest.py` (все дайджесты на сегодня)
-или `python digest.py weekly` (конкретный, независимо от дня)."""
+или `python digest.py weekly` (конкретный, независимо от дня).
+`python digest.py --scheduled` запускают каждый час (GitHub Actions): сам проверяет, пора ли слать
+(время send_time из меню бота или config.yaml, окно 3 часа, раз в день), и если не пора, тихо выходит."""
 import os, re, sys, json, time, html, smtplib, calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -349,6 +351,18 @@ if __name__ == "__main__":
     only = pos[0] if pos else None
     mode = "publish" if "--publish" in flags else "draft" if "--draft" in flags else "send"
     now = datetime.now(ZoneInfo(defaults.get("timezone", "Asia/Yekaterinburg")))
+    if "--scheduled" in flags:
+        st = settings.load()
+        hh, mm = map(int, str(defaults.get("send_time") or "09:00").split(":"))
+        start = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        today = now.strftime("%Y-%m-%d")
+        if st.get("last_run") == today:
+            sys.exit(print("Сегодня уже отправляла, выхожу"))
+        if not (start <= now < start + timedelta(hours=3)):
+            sys.exit(print(f"Не время: сейчас {now:%H:%M}, рассылка в {hh:02d}:{mm:02d} (окно 3 часа)"))
+        # сначала отмечаем «сегодня запущено» (если отметить не вышло, ничего не шлём: следующий час попробует снова)
+        settings.update(lambda x: x.__setitem__("last_run", today))
+        print("Пора слать:", now.isoformat())
     failed, matched = False, False
     for name, raw in cfg["digests"].items():
         d = {**defaults, **raw}
