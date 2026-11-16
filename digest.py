@@ -36,10 +36,14 @@ PROMPT = """Ты редактор новостной подборки для Tel
 Правила:
 - разрешены только теги <b> и <a>, никакого markdown;
 - в качестве текста ссылки используй название источника из списка;
-- URL бери ровно из списка, ничего не выдумывай и не добавляй фактов, которых там нет.
+- URL бери ровно из списка, ничего не выдумывай и не добавляй фактов, которых там нет.{extra_rules}
 
 Новости:
 {items}"""
+
+GOOD_NEWS_RULES = """
+- ТОЛЬКО добрые, позитивные или просто полезные новости: открытия, достижения, культура, афиши и события, помощь людям, природа, победы, улучшения в городах. Полностью пропускай всё про войну, СВО, обстрелы, теракты, насилие, преступления, смерти и трагедии, катастрофы, санкции, политические конфликты и тревожные новости;
+- если подходящих новостей нет совсем, ответь ровно одним словом: НЕТ"""
 
 TAG_RE = re.compile(r'<(?:/?b|a href="[^"<>]+"|/a)>')
 
@@ -62,7 +66,29 @@ def sanitize(text):
     return res
 
 
+def stop_filter(d):
+    """Функция «заголовок плохой?» по stop_words из config.yaml. Аббревиатуры (СВО, ВСУ) ищем целым словом
+    с учётом регистра, остальное с начала слова без учёта регистра. keep_phrases вырезаем перед проверкой."""
+    pats = []
+    for w in d.get("stop_words") or []:
+        w = str(w).strip()
+        if not w:
+            continue
+        if w.isupper() and len(w) <= 5:
+            pats.append(re.compile(rf"(?<!\w){re.escape(w)}(?!\w)"))
+        else:
+            pats.append(re.compile(rf"(?<!\w){re.escape(w)}", re.IGNORECASE))
+    keep = [re.compile(re.escape(str(k)), re.IGNORECASE) for k in d.get("keep_phrases") or [] if str(k).strip()]
+
+    def bad(text):
+        for k in keep:
+            text = k.sub(" ", text)
+        return any(p.search(text) for p in pats)
+    return bad
+
+
 def fetch_topic(topic, d):
+    bad = stop_filter(d)
     days = d["period_days"]
     urls = [
         f"https://news.google.com/rss/search?q={quote(q)}+when:{days}d&hl=ru&gl=RU&ceid=RU:ru"
@@ -83,8 +109,11 @@ def fetch_topic(topic, d):
             if ts < cutoff or key in seen or not title:
                 continue
             seen.add(key)
+            desc = clean(e.get("summary"))[:200]
+            if bad(title + " " + desc):
+                continue
             source = (e.get("source") or {}).get("title") or feed.feed.get("title", "источник")
-            items.append((ts, title, source, e.get("link", ""), clean(e.get("summary"))[:200]))
+            items.append((ts, title, source, e.get("link", ""), desc))
     items.sort(reverse=True)
     return items[: d["max_items_per_topic"]]
 
@@ -124,8 +153,12 @@ def summarize(topic, items, d):
         topic=topic["name"], n=d["news_per_topic"], language=d["language"],
         style=d["style"] + (". " + topic["hint"] if topic.get("hint") else ""),
         emoji_part="<эмодзи по смыслу> " if d["emoji_per_news"] else "",
+        extra_rules=GOOD_NEWS_RULES if d.get("good_news_only") else "",
         items="\n".join(lines))
-    return sanitize(llm_call(prompt))
+    answer = llm_call(prompt)
+    if d.get("good_news_only") and re.fullmatch(r"\W*НЕТ\W*", answer, re.IGNORECASE):
+        return None  # модель не нашла ничего доброго: раздел пропускаем
+    return sanitize(answer)
 
 
 def build_blocks(d, now):
@@ -138,6 +171,9 @@ def build_blocks(d, now):
             body = summarize(topic, items, d)
         except Exception as e:
             print("LLM error", topic["name"], e)
+            continue
+        if not body:
+            print("Нет подходящих новостей:", topic["name"])
             continue
         blocks.append(f"{topic.get('emoji', '📌')} <b>{html.escape(topic['name'])}</b>\n\n{body}")
         time.sleep(d.get("pause_seconds", 8))  # пауза, чтобы не упереться в лимиты
