@@ -27,7 +27,7 @@ MONTHS = ["января", "февраля", "марта", "апреля", "ма�
           "сентября", "октября", "ноября", "декабря"]
 
 PROMPT = """Ты редактор новостной подборки для Telegram-паблика. Раздел: «{topic}».
-Ниже новости за период. Выбери {n} самых важных и интересных, дубликаты объедини.
+Ниже новости за период. Выбери не больше {n} самых важных и интересных, дубликаты объедини.
 Язык: {language}. Стиль: {style}.
 
 Формат каждой новости СТРОГО такой, новости разделяй пустой строкой:
@@ -42,7 +42,7 @@ PROMPT = """Ты редактор новостной подборки для Tel
 {items}"""
 
 GOOD_NEWS_RULES = """
-- ТОЛЬКО добрые, позитивные или просто полезные новости: открытия, достижения, культура, афиши и события, помощь людям, природа, победы, улучшения в городах. Полностью пропускай всё про войну, СВО, обстрелы, теракты, насилие, преступления, смерти и трагедии, катастрофы, санкции, политические конфликты и тревожные новости;
+- ТОЛЬКО добрые, интересные или полезные новости: открытия, достижения, культура и искусство, афиши и события, помощь людям, природа, спорт и победы, улучшения в городах, любопытные истории и прецеденты. Полностью пропускай всё про войну, СВО, обстрелы, теракты, насилие, преступления, смерти и трагедии, катастрофы, санкции, политические конфликты и тревожные новости;
 - если подходящих новостей нет совсем, ответь ровно одним словом: НЕТ"""
 
 TAG_RE = re.compile(r'<(?:/?b|a href="[^"<>]+"|/a)>')
@@ -150,7 +150,7 @@ def summarize(topic, items, d):
         extra = f" | {desc}" if desc and desc.lower() != title.lower() else ""
         lines.append(f"- {title}{extra} | источник: {source} | {link}")
     prompt = PROMPT.format(
-        topic=topic["name"], n=d["news_per_topic"], language=d["language"],
+        topic=topic["name"], n=topic.get("news", d["news_per_topic"]), language=d["language"],
         style=d["style"] + (". " + topic["hint"] if topic.get("hint") else ""),
         emoji_part="<эмодзи по смыслу> " if d["emoji_per_news"] else "",
         extra_rules=GOOD_NEWS_RULES if d.get("good_news_only") else "",
@@ -420,6 +420,8 @@ if __name__ == "__main__":
                 continue
         elif d.get("days") and DAY_KEYS[now.weekday()] not in d["days"]:
             continue  # сегодня не его день
+        elif not only and d.get("weeks") and ((now.day - 1) // 7 + 1) not in d["weeks"]:
+            continue  # не та неделя месяца (weeks: [1] = только первая неделя)
         matched = True
         ok = publish(name, d, now, cfg) if mode == "publish" else run_digest(name, d, now, cfg, mode)
         failed = failed or not ok
