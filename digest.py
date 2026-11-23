@@ -1,6 +1,7 @@
 """Новостной дайджест по расписанию: RSS -> LLM-сжатие -> Telegram + e-mail.
 Все настройки в config.yaml. Запуск: `python digest.py` (все дайджесты на сегодня)
 или `python digest.py weekly` (конкретный, независимо от дня).
+`python digest.py --dry monday` собирает выпуск и присылает ТОЛЬКО админу в личку (проверка, в паблик ничего не уходит).
 `python digest.py --scheduled` запускают каждый час (GitHub Actions): сам проверяет, пора ли слать
 (время send_time из меню бота или config.yaml, окно 3 часа, раз в день), и если не пора, тихо выходит."""
 import os, re, sys, json, time, html, smtplib, calendar
@@ -309,10 +310,14 @@ def send_email(blocks, d, now):
         s.sendmail(user, [a.strip() for a in to.split(",")], msg.as_string())
 
 
+def admin_id():
+    """Первый ID из TG_ADMIN_ID (их может быть несколько через запятую)."""
+    return next((x for x in re.split(r"[,;\s]+", os.getenv("TG_ADMIN_ID", "")) if x), "")
+
+
 def tell_admin(text):
     """Короткое сообщение главному админу (первый ID из TG_ADMIN_ID). Без секрета молча пропускаем."""
-    token = os.getenv("TG_TOKEN")
-    admin = next((x for x in re.split(r"[,;\s]+", os.getenv("TG_ADMIN_ID", "")) if x), "")
+    token, admin = os.getenv("TG_TOKEN"), admin_id()
     if not (token and admin):
         return
     try:
@@ -374,6 +379,21 @@ def run_digest(name, d, now, cfg, mode="send"):
         save_drafts(dr)
         print("Черновик готов:", name)
         return True
+    if mode == "dry":
+        # проверка: подборка уходит ТОЛЬКО админу в личку, ни паблик, ни подписчики, ни почта не трогаются
+        token, admin = os.getenv("TG_TOKEN"), admin_id()
+        if not (token and admin):
+            print("Для проверки нужен секрет TG_ADMIN_ID, ничего не отправляю")
+            return False
+        if not blocks:
+            print("Нет новостей за период (в боевом запуске был бы пропуск)")
+            return False
+        tg_send(token, admin, f"🧪 <b>ПРОВЕРКА «{html.escape(name)}»</b>: в паблик и подписчикам ничего не отправлено")
+        for m in chunk(blocks):
+            tg_send(token, admin, m)
+            time.sleep(1)
+        print("Проверочная подборка отправлена админу")
+        return True
     return deliver(name, d, blocks, now, cfg)
 
 
@@ -398,7 +418,8 @@ if __name__ == "__main__":
     flags = [a for a in sys.argv[1:] if a.startswith("--")]
     pos = [a for a in sys.argv[1:] if not a.startswith("--")]
     only = pos[0] if pos else None
-    mode = "publish" if "--publish" in flags else "draft" if "--draft" in flags else "send"
+    mode = ("publish" if "--publish" in flags else "draft" if "--draft" in flags
+            else "dry" if "--dry" in flags else "send")
     now = datetime.now(ZoneInfo(defaults.get("timezone", "Asia/Yekaterinburg")))
     if "--scheduled" in flags:
         st = settings.load()

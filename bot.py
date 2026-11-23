@@ -33,7 +33,7 @@ def dispatch_digest(name):
     if not wf:
         raise RuntimeError("не нашла workflow «News digest»")
     r = requests.post(f"{base}/{wf['id']}/dispatches", headers=h, timeout=30,
-                      json={"ref": os.getenv("GITHUB_REF_NAME") or "main", "inputs": {"digest": name}})
+                      json={"ref": os.getenv("GITHUB_REF_NAME") or "main", "inputs": {"digest": name, "dry": "false"}})
     r.raise_for_status()
 
 

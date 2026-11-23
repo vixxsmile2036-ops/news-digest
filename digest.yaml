@@ -10,6 +10,10 @@ on:
         description: "Имя выпуска из config.yaml: monday, wednesday или friday (пусто = всё, что положено на сегодня)"
         required: false
         default: ""
+      dry:
+        description: "Проверка: подборка придёт только тебе в личку, в паблик и подписчикам ничего не уйдёт (сними галочку, чтобы отправить по-настоящему)"
+        type: boolean
+        default: true
 concurrency:
   group: digest
   cancel-in-progress: false
@@ -29,6 +33,7 @@ jobs:
       - name: Рассылка
         env:
           DIGEST: ${{ github.event.inputs.digest }}
+          DRY: ${{ github.event.inputs.dry }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
@@ -45,6 +50,8 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then
             python digest.py --scheduled
+          elif [ "$DRY" = "true" ]; then
+            python digest.py --dry "$DIGEST"
           else
             python digest.py "$DIGEST"
           fi
